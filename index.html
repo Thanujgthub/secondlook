@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SecondLook</title>
+  <meta name="description" content="Before a streetlight complaint is closed, SecondLook checks whether the repair photo shows what the resident asked to have fixed.">
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231f3a4d'/%3E%3Cpath d='M12 26V9a4 4 0 0 1 4-4h4' stroke='%23f3f1ea' stroke-width='2.5' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='21' cy='8' r='3.5' fill='%23f2b33d'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="./css/styles.css">
+</head>
+<body>
+  <a class="skip" href="#review-form">Skip to the review form</a>
+
+  <header class="masthead">
+    <div class="wrap masthead-inner">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7"/><path d="M12 26V9a4 4 0 0 1 4-4h4"/><circle cx="21" cy="8" r="3.5"/></svg>
+        <div>
+          <h1>SecondLook</h1>
+          <p class="purpose">Checks whether a repair photo shows what the resident asked to have fixed, before a streetlight complaint is closed.</p>
+        </div>
+      </div>
+      <p class="principle">AI checks the evidence. The supervisor decides.</p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="demo-strip" aria-labelledby="demo-title">
+      <div class="demo-head">
+        <h2 id="demo-title">Guided demo</h2>
+        <p>Same lamp, three reviews. Each step sets the complaint and photo for you.</p>
+      </div>
+      <ol class="steps">
+        <li><button type="button" class="step" data-step="0"><span class="step-n" aria-hidden="true">1</span><span><strong>Day photo</strong><small>Daytime shot of the Gate 2 pole</small></span></button></li>
+        <li><button type="button" class="step" data-step="1"><span class="step-n" aria-hidden="true">2</span><span><strong>Night photo</strong><small>The Gate 2 lamp, switched on</small></span></button></li>
+        <li><button type="button" class="step" data-step="2"><span class="step-n" aria-hidden="true">3</span><span><strong>Whole row</strong><small>Same photo, wider complaint</small></span></button></li>
+      </ol>
+    </section>
+
+    <div class="layout">
+      <form id="review-form" class="panel inputs" novalidate>
+        <fieldset class="mode">
+          <legend>Review mode</legend>
+          <div class="segmented">
+            <label><input type="radio" name="mode" value="demo" checked> <span>Demo</span></label>
+            <label><input type="radio" name="mode" value="live"> <span>Live</span></label>
+          </div>
+          <p class="mode-note" id="mode-note">Demo uses saved reviews for the sample photos and preset complaints. No key needed.</p>
+          <div class="live-fields" id="live-fields" hidden>
+            <div class="field">
+              <label for="provider">Model provider</label>
+              <select id="provider">
+                <option value="claude">Claude</option>
+                <option value="gemini">Gemini</option>
+              </select>
+            </div>
+            <div class="field grow">
+              <label for="api-key">API key</label>
+              <input id="api-key" type="password" autocomplete="new-password" data-lpignore="true" data-1p-ignore spellcheck="false" aria-describedby="key-note">
+            </div>
+            <p class="hint" id="key-note">Kept in this browser tab only (session storage) and sent straight to the provider.</p>
+          </div>
+        </fieldset>
+
+        <div class="block">
+          <div class="block-head">
+            <h2 id="complaint-title"><span class="num" aria-hidden="true">1</span> Complaint</h2>
+          </div>
+          <div class="chips" id="chips" role="group" aria-label="Preset complaints"></div>
+          <label class="sr-only" for="complaint">Complaint text</label>
+          <textarea id="complaint" rows="3" aria-describedby="complaint-help" placeholder="Type the resident's complaint"></textarea>
+          <p class="hint" id="complaint-help">Use the resident's own words. The review checks the photo against exactly this text.</p>
+        </div>
+
+        <fieldset class="block photo" aria-labelledby="photo-title">
+          <legend><span class="block-legend" id="photo-title"><span class="num" aria-hidden="true">2</span> Repair photo</span></legend>
+          <div class="samples" id="samples"></div>
+          <div class="upload-row">
+            <input type="file" id="upload" class="sr-only" accept=".jpg,.jpeg,.png,image/jpeg,image/png" aria-describedby="upload-help upload-error">
+            <label for="upload" class="btn btn-secondary">Upload a photo</label>
+            <span class="hint" id="upload-help">JPG or PNG, up to 5 MB.</span>
+          </div>
+          <p class="field-error" id="upload-error" role="alert"></p>
+          <figure class="preview" id="preview" hidden>
+            <img id="preview-img" alt="">
+            <figcaption id="preview-cap"></figcaption>
+          </figure>
+        </fieldset>
+
+        <p class="demo-hint" id="demo-hint" hidden>Demo mode covers the sample photos and preset complaints. Switch to Live and add an API key to review your own.</p>
+
+        <div class="submit-row">
+          <button type="submit" class="btn btn-primary" id="review-btn">
+            <span class="spinner" aria-hidden="true"></span><span class="btn-label">Review photo</span>
+          </button>
+          <p class="hint" id="form-error" role="alert"></p>
+        </div>
+      </form>
+
+      <section class="panel result" aria-labelledby="result-title">
+        <h2 id="result-title"><span class="num" aria-hidden="true">3</span> Review</h2>
+        <div id="result" tabindex="-1" aria-live="polite" aria-atomic="true"></div>
+        <div class="actions" role="group" aria-label="Supervisor decision">
+          <button type="button" class="btn btn-primary" id="accept-btn" disabled>Accept evidence</button>
+          <button type="button" class="btn btn-secondary" id="followup-btn" disabled>Ask for follow-up</button>
+        </div>
+        <p class="decision" id="decision" tabindex="-1" role="status"></p>
+      </section>
+    </div>
+  </main>
+
+  <footer class="wrap footer">
+    <p>SecondLook reviews one photo against one complaint. It checks the evidence, not the repair history, and it never closes a case. Sample scenes are illustrations.</p>
+  </footer>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
