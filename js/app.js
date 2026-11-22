@@ -298,7 +298,7 @@ function init() {
   els.complaint.addEventListener('input', invalidate);
   els.upload.addEventListener('change', handleUpload);
   els.form.addEventListener('submit', (e) => { e.preventDefault(); runReview(); });
-  els.form.addEventListener('change', (e) => { if (e.target.name === 'mode') syncMode(); });
+  els.form.addEventListener('change', (e) => { if (e.target.name === 'mode') { syncMode(); invalidate(); } });
   els.accept.addEventListener('click', () => decide('accept'));
   els.followup.addEventListener('click', () => decide('followup'));
   document.querySelectorAll('.step').forEach((btn) => btn.addEventListener('click', () => runStep(Number(btn.dataset.step))));
