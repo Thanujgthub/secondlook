@@ -1,70 +1,106 @@
-# SecondLook build contract (shared by all agents)
+# SecondLook v2 build contract (shared by all agents)
 
-Static site, no build step, no framework, no npm. Deployed to GitHub Pages from the repo root.
-Plain ES modules loaded by the browser. Must work when opened from a static server at a sub-path
-(e.g. https://user.github.io/secondlook/), so use RELATIVE paths only (`./samples/x.png`, never `/samples`).
+Static site, no build step, no framework, no npm deps at runtime. Deployed to GitHub Pages at
+https://thanujgthub.github.io/secondlook/ — RELATIVE paths only (`./samples/x.jpg`, never `/samples`).
+Plain ES modules. Everything must work offline-of-AI in Demo mode.
 
-## Files and owners
+## Product story (what judges must get in 60 seconds)
 
-| File | Owner |
+A ward supervisor closes streetlight complaints. Field crews mark them "fixed" and attach a photo.
+SecondLook takes a second look: it splits the complaint into checkable claims (place, time of day,
+lamp state, how many lights) and checks each against what the photo visibly shows. Outcome:
+- `ready`        — "Ready for sign-off": the photo answers the complaint. Supervisor decides.
+- `needs_photo`  — "Needs a better photo": the photo can't prove it (daytime, wrong place, too narrow).
+- `not_fixed`    — "Repair incomplete": the photo shows the problem is still there (e.g. 2 of 5 lamps dark).
+The AI never closes a case. The supervisor signs off or sends it back.
+
+## Files and owners (nobody edits a file owned by someone else)
+
+| Files | Owner |
 | --- | --- |
-| `samples/gate2-day.png`, `samples/gate2-night.png`, `samples/gate3-night.png` | samples agent |
-| `scripts/make_samples.py` | samples agent |
-| `js/data.js`, `js/review.js` | logic agent |
-| `index.html`, `css/styles.css`, `js/app.js` | UI agent |
-| `README.md`, `.github/workflows/pages.yml`, `.nojekyll` | lead |
+| `samples/*.jpg`, `scripts/make_samples.*` | samples agent |
+| `js/data.js`, `js/review.js`, `scripts/test-review.mjs`, `scripts/live-eval.mjs` | logic agent |
+| `index.html`, `css/**`, `js/app.js`, `js/ui/**`, `assets/**` (except `assets/icon.svg` may be replaced) | UI agent |
+| `README.md`, `docs/**`, deploy | lead |
 
-Nobody edits a file owned by someone else.
+## Sample photos — `samples/<id>.jpg`, 1600x1200 (4:3), JPEG q≈85, each < 450 KB
 
-## Sample photos (illustrated scenes, PNG, 1200x900)
+| id | Shows |
+| --- | --- |
+| `gate2-day` | DAYTIME. One streetlight pole beside a gate with a clearly readable sign "GATE 2". Lamp off. Only one pole. |
+| `gate2-night` | NIGHT. Same single lamp beside the "GATE 2" sign, clearly ON. Only this one lamp in frame. |
+| `gate3-night` | NIGHT. A lit lamp beside a gate whose sign reads "GATE 3" (wrong place). |
+| `row-partial` | NIGHT, wide view. The "GATE 2" sign and a row of exactly 5 streetlights along the same wall/road: 3 ON, 2 clearly OFF/dark. |
+| `row-full` | NIGHT, same wide view. "GATE 2" sign, all 5 streetlights ON. |
 
-- `gate2-day.png` — DAYTIME. One streetlight pole beside a gate with a clearly readable sign "GATE 2". Lamp is off (it's day).
-- `gate2-night.png` — NIGHT. The same single lamp beside the "GATE 2" sign, clearly switched ON (glow, light cone). Only this one lamp in frame; no other poles visible.
-- `gate3-night.png` — NIGHT. A lit lamp beside a gate whose sign reads "GATE 3" (the wrong location).
-
-## js/data.js (logic agent) exports
+## Complaints and cases
 
 ```js
-export const SAMPLES = [ { id: 'gate2-day', file: './samples/gate2-day.png', label: 'Daytime: Gate 2 pole' }, { id: 'gate2-night', ... label: 'Night: Gate 2 lamp lit' }, { id: 'gate3-night', ... label: 'Night: Gate 3 lamp lit' } ];
-export const COMPLAINTS = [ { id: 'single', label: 'One lamp', text: 'The streetlight beside Gate 2 stays dark at night.' }, { id: 'row', label: 'Whole row', text: 'The entire row of lights by Gate 2 stays dark.' } ];
-export const DEMO_RESULTS = { 'gate2-day|single': Review, 'gate2-night|single': Review, 'gate2-night|row': Review, 'gate3-night|single': Review, 'gate2-day|row': Review, 'gate3-night|row': Review };
+// js/data.js
+export const COMPLAINTS = {
+  single: 'The streetlight beside Gate 2 stays dark at night.',
+  row:    'The entire row of lights by Gate 2 stays dark.',
+};
+export const SAMPLES = { 'gate2-day': { file: './samples/gate2-day.jpg', mimeType: 'image/jpeg', label: 'Gate 2 pole, daytime' }, ... all 5 };
+export const CASES = [
+  { id: 'SL-1042', title: 'Streetlight out beside Gate 2', complaintId: 'single', location: 'Gate 2, Market Road, Ward 14',
+    reportedBy: 'Resident via grievance portal', reportedAt: '2026-11-18T21:40:00+05:30', crewNote: 'Lamp replaced. Marked fixed.',
+    photos: ['gate2-day', 'gate2-night'] },
+  { id: 'SL-1043', title: 'Whole row dark by Gate 2', complaintId: 'row', ..., photos: ['gate2-night', 'row-partial', 'row-full'] },
+  { id: 'SL-1047', title: 'Lamp out at Gate 2 entrance', complaintId: 'single', ..., photos: ['gate3-night', 'gate2-night'] },
+];
+// Presenter script: each step selects a case + photo and runs the review.
+export const DEMO_STEPS = [
+  { caseId: 'SL-1042', photoId: 'gate2-day',   say: 'A daytime photo can't show a lamp works at night.' },
+  { caseId: 'SL-1042', photoId: 'gate2-night', say: 'The lit Gate 2 lamp answers the complaint. The supervisor signs off.' },
+  { caseId: 'SL-1043', photoId: 'gate2-night', say: 'Same photo, wider complaint: one lamp says nothing about the row.' },
+  { caseId: 'SL-1043', photoId: 'row-partial', say: 'The wide shot shows two lamps still dark: repair incomplete.' },
+  { caseId: 'SL-1043', photoId: 'row-full',    say: 'All five lit: ready for sign-off.' },
+];
+export const DEMO_RESULTS = { '<photoId>|<complaintId>': Review }  // all 10 combinations
 ```
 
-## js/review.js (logic agent) exports
+Expected outcomes (demo data AND live model must agree):
+
+| photo | single | row |
+| --- | --- | --- |
+| gate2-day | needs_photo | needs_photo |
+| gate2-night | ready | needs_photo |
+| gate3-night | needs_photo | needs_photo |
+| row-partial | ready (Gate 2 lamp itself is lit) | not_fixed |
+| row-full | ready | ready |
+
+## Review shape
 
 ```js
-// Review = { status: 'ready' | 'needs_photo', observation: string, next_photo_request: string | null }
-// status 'ready'        => "Ready for human review"  (next_photo_request is null)
-// status 'needs_photo'  => "Request another photo"   (next_photo_request is one specific sentence)
+// Review
+{
+  status: 'ready' | 'needs_photo' | 'not_fixed',
+  observation: string,               // one sentence summary citing visible details
+  checks: [                          // 2–5 items, the complaint split into checkable claims
+    { label: string,                 // 'Location' | 'Time of day' | 'Lamp state' | 'Coverage' ...
+      expected: string,              // what the complaint needs, e.g. 'Lamp beside Gate 2'
+      seen: string,                  // what the photo shows, e.g. 'Sign reads GATE 3'
+      result: 'pass' | 'fail' | 'unclear' }
+  ],
+  next_photo_request: string | null, // null iff ready. needs_photo: what photo to take next.
+                                     // not_fixed: instruction to the crew (what still needs repair).
+  model: string,                     // set by review.js, e.g. 'Gemini 3.6 Flash', 'Claude Haiku 5.5', 'Demo data'
+}
+```
 
-export async function reviewPhoto({
-  complaint,      // string, the complaint text as currently typed
-  image,          // { dataUrl: string, mimeType: 'image/png'|'image/jpeg' }
-  sampleId,       // string | null  — set only when the image is an unmodified sample
-  mode,           // 'demo' | 'live'
-  provider,       // 'claude' | 'gemini'   (live only)
-  apiKey,         // string                (live only)
-  signal,         // AbortSignal | undefined
-}) -> Promise<Review>
-// Demo mode: looks up DEMO_RESULTS[`${sampleId}|${complaintId}`] where complaintId is the COMPLAINTS
-// entry whose text === complaint (trimmed). Adds a short artificial delay (~700ms).
-// If no match (custom text or uploaded photo) it throws DemoUnavailableError.
-// Live mode: one vision-model call; validates JSON; throws ReviewError with a user-safe message on
-// network/HTTP/parse failure. Never returns a partially valid Review.
+## js/review.js exports
 
+```js
+export async function reviewPhoto({ complaint, image /* {dataUrl, mimeType} | null in demo */, photoId /* sample id or null */,
+  mode /* 'demo'|'live' */, provider /* 'gemini'|'claude' */, apiKey, signal, onStatus /* optional (text) => void */ }) -> Promise<Review>
 export class ReviewError extends Error {}
 export class DemoUnavailableError extends ReviewError {}
+export const STATUS_LABELS = { ready: 'Ready for sign-off', needs_photo: 'Needs a better photo', not_fixed: 'Repair incomplete' };
 ```
-
-## UI behaviour (UI agent)
-
-- One screen. Left: complaint (preset chips + editable textarea), photo (sample picker thumbnails + JPG/PNG upload, preview). Right: result panel.
-- "Review photo" button calls `reviewPhoto`. While running: button disabled, spinner, Abort on new run.
-- Result shows status badge (Ready for human review / Request another photo), observation, next_photo_request.
-- Supervisor actions: "Accept evidence" (enabled ONLY when status==='ready' and result is fresh) and "Ask for follow-up" (enabled when any fresh result). Accepting shows "Complaint closed by supervisor".
-- Any edit to complaint text or change of photo CLEARS the result and the acceptance (stale results can never be accepted).
-- Error: show "Review unavailable" + message + Retry; Accept disabled.
-- Mode toggle: Demo (default, no key needed, works only with presets+samples) / Live (provider select Claude|Gemini + API key field; key kept in sessionStorage only, wrapped in try/catch; never logged).
-- In demo mode, uploading a photo or editing to custom text shows a clear hint: "Demo mode covers the sample photos and preset complaints. Switch to Live and add an API key to review your own."
-- Guided 3-step demo strip ("1 Day photo · 2 Night photo · 3 Whole row") that sets the inputs for each step with one click.
-- Responsive to 360px width, keyboard accessible, visible focus, light and dark (prefers-color-scheme).
+- Demo: complaint must equal one of COMPLAINTS (trimmed) and photoId must be a sample, else DemoUnavailableError. ~900 ms delay (abortable).
+- Live Gemini: model fallback chain `gemini-3.8-flash` → `gemini-3.7-flash` → `gemini-3.6-flash` → `gemini-3.5-flash` → `gemini-3.1-flash-lite`.
+  Move to the next model on HTTP 503/500/429/404 or a 25 s per-attempt timeout; call `onStatus('Gemini 3.8 Flash is busy, trying Gemini 3.7 Flash…')`.
+  401/403/400 API_KEY_INVALID => "API key rejected." (no fallback).
+- Live Claude: `claude-haiku-5-5` (as v1).
+- AbortError from the caller's signal passes through unwrapped.

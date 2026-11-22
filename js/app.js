@@ -1,316 +1,590 @@
-import { SAMPLES, COMPLAINTS } from './data.js';
-import { reviewPhoto, ReviewError, DemoUnavailableError } from './review.js';
+// SecondLook v2: the ward supervisor's evidence-review desk.
+// State lives here; rendering is delegated to small modules in ./ui/.
+import { CASES, COMPLAINTS, SAMPLES, DEMO_STEPS } from './data.js';
+import { reviewPhoto, DemoUnavailableError, ReviewError, STATUS_LABELS } from './review.js';
+import { $, h, mount, clear } from './ui/dom.js';
+import { icon, hydrateIcons } from './ui/icons.js';
+import { ago, formatStamp, formatTime, isoAttr } from './ui/format.js';
+import { chip, chipKey, VERDICT_TONE } from './ui/status.js';
+import { renderQueue } from './ui/queue.js';
+import { renderFilmstrip, showPhoto, showEmpty, setScanning, flashDone, dropzone } from './ui/evidence.js';
+import { renderIdle, renderLoading, updateLoadingText, renderError, renderResult } from './ui/review-panel.js';
+import { renderTimeline } from './ui/timeline.js';
+import { createSettings } from './ui/settings.js';
+import { createPresenter } from './ui/presenter.js';
 
-const $ = (id) => document.getElementById(id);
+const OWN = 'own';
 const MAX_BYTES = 5 * 1024 * 1024;
-const TYPES = ['image/png', 'image/jpeg'];
-const STORE_KEY = 'secondlook.apiKey';
-const STORE_PROVIDER = 'secondlook.provider';
-const DEMO_HINT = 'Demo mode covers the sample photos and preset complaints. Switch to Live and add an API key to review your own.';
-const STEPS = [
-  { complaint: 'single', sample: 'gate2-day' },
-  { complaint: 'single', sample: 'gate2-night' },
-  { complaint: 'row', sample: 'gate2-night' },
-];
-const ICONS = {
-  ready: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 10.5l3.2 3.2L15 7"/></svg>',
-  needs_photo: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 7h3l1.5-2h5L14 7h3v8H3z"/><circle cx="10" cy="11" r="2.5"/></svg>',
-  error: '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 6v5M10 14v.01"/><circle cx="10" cy="10" r="7.5"/></svg>',
+const UNDO_MS = 5000;
+const DEMO_STATUS = ['Reading the complaint…', 'Splitting it into checks…', 'Looking at the photo…', 'Comparing each claim…'];
+const PROVIDER_LABEL = { gemini: 'Gemini', claude: 'Claude' };
+
+hydrateIcons();
+
+// ---------- state ----------
+
+const caseById = Object.fromEntries(CASES.map((c) => [c.id, c]));
+
+function seedEvents(c) {
+  return [
+    { kind: 'reported', title: 'Reported', detail: c.reportedBy, at: c.reportedAt },
+    { kind: 'crew', title: 'Crew marked fixed', detail: `“${c.crewNote}” ${c.photos.length} photos attached.`, at: c.crewMarkedAt || null },
+  ];
+}
+const blank = () => ({ run: null, statusText: '', result: null, error: null, decision: null, message: '' });
+
+const app = {
+  mode: 'demo',
+  caseId: CASES[0].id,
+  states: {
+    ...Object.fromEntries(CASES.map((c) => [c.id, { ...blank(), photoId: c.photos[c.photos.length - 1], events: seedEvents(c) }])),
+    [OWN]: { ...blank(), image: null, complaint: '', uploadError: '', events: [] },
+  },
 };
+let runSeq = 0;
 
-const els = {
-  form: $('review-form'), complaint: $('complaint'), chips: $('chips'), samples: $('samples'),
-  upload: $('upload'), uploadError: $('upload-error'), preview: $('preview'), previewImg: $('preview-img'),
-  previewCap: $('preview-cap'), hint: $('demo-hint'), reviewBtn: $('review-btn'), formError: $('form-error'),
-  result: $('result'), accept: $('accept-btn'), followup: $('followup-btn'), decision: $('decision'),
-  liveFields: $('live-fields'), modeNote: $('mode-note'), provider: $('provider'), apiKey: $('api-key'),
-};
+const settings = createSettings({
+  onChange: (s) => {
+    $('mode-provider').textContent = ` · ${PROVIDER_LABEL[s.provider]}`;
+    if (app.mode === 'live') invalidateAll();
+    renderDynamic();
+  },
+});
+$('mode-provider').textContent = ` · ${PROVIDER_LABEL[settings.get().provider]}`;
 
-// image: { sampleId, src, label, mimeType, dataUrl } — dataUrl loaded lazily for samples.
-const state = { image: null, review: null, error: null, decision: null, running: false, controller: null, runId: 0, retryable: true };
-let uploadSeq = 0; // a newer photo choice cancels a slow upload read
+const cur = () => app.states[app.caseId];
+const isOwn = (id = app.caseId) => id === OWN;
+const complaintOf = (id) => (isOwn(id) ? app.states[OWN].complaint.trim() : COMPLAINTS[caseById[id].complaintId]);
+const photoKeyOf = (id) => (isOwn(id) ? (app.states[OWN].image ? `upload:${app.states[OWN].image.stamp}` : '') : app.states[id].photoId);
+const freshKey = (id) => [app.mode, app.mode === 'live' ? settings.get().provider : '', photoKeyOf(id), complaintOf(id)].join('|');
+const isFresh = (id) => Boolean(app.states[id].result && app.states[id].result.key === freshKey(id));
 
-const session = {
-  get(key) { try { return sessionStorage.getItem(key); } catch { return null; } },
-  set(key, value) { try { value ? sessionStorage.setItem(key, value) : sessionStorage.removeItem(key); } catch { /* storage unavailable */ } },
-};
-
-function el(tag, className, text) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text != null) node.textContent = text;
-  return node;
+function attemptLabel(id, photoId = app.states[id].photoId) {
+  if (isOwn(id)) return 'your photo';
+  const n = caseById[id].photos.indexOf(photoId) + 1;
+  return `attempt ${n}`;
 }
 
-const mode = () => els.form.elements.mode.value;
-const complaintText = () => els.complaint.value.trim();
-const presetFor = (text) => COMPLAINTS.find((c) => c.text === text);
-
-// ---------- Inputs ----------
-
-function buildInputs() {
-  for (const c of COMPLAINTS) {
-    const chip = el('button', 'chip', c.label);
-    chip.type = 'button';
-    chip.dataset.id = c.id;
-    chip.title = c.text;
-    chip.addEventListener('click', () => setComplaint(c.text));
-    els.chips.append(chip);
-  }
-  for (const s of SAMPLES) {
-    const label = el('label', 'sample');
-    const input = el('input', 'sr-only');
-    Object.assign(input, { type: 'radio', name: 'sample', value: s.id });
-    input.addEventListener('change', () => selectSample(s.id));
-    const img = el('img');
-    Object.assign(img, { src: s.file, alt: '', width: 160, height: 120, decoding: 'async' });
-    label.append(input, img, el('span', null, s.label));
-    els.samples.append(label);
-  }
+// Any change of photo, complaint or mode lands here: no stale result or sign-off survives it.
+function invalidate(id) {
+  const s = app.states[id];
+  abortRun(id);
+  s.result = null;
+  s.error = null;
+  s.decision = null;
+  s.message = '';
+  if (pendingUndo?.caseId === id) dismissToast();
+}
+function invalidateAll() {
+  for (const id of Object.keys(app.states)) invalidate(id);
+}
+function abortRun(id) {
+  const s = app.states[id];
+  if (!s.run) return;
+  s.run.controller.abort();
+  clearInterval(s.run.timer);
+  s.run = null;
+  s.statusText = '';
+  if (id === app.caseId) setScanning(false);
 }
 
-function setComplaint(text) {
-  if (els.complaint.value === text) return;
-  els.complaint.value = text;
-  invalidate();
+// ---------- actions ----------
+
+function selectCase(id) {
+  if (id === app.caseId) return;
+  abortRun(app.caseId);
+  app.caseId = id;
+  renderAll();
 }
 
-function selectSample(id) {
-  const s = SAMPLES.find((x) => x.id === id);
-  if (!s) return;
-  if (state.image?.sampleId === id) return;
-  els.form.elements.sample.forEach((r) => { r.checked = r.value === id; });
-  uploadSeq++;
-  els.upload.value = '';
-  els.uploadError.textContent = '';
-  setImage({ sampleId: id, src: s.file, label: s.label, mimeType: 'image/png', dataUrl: null });
+function selectPhoto(photoId) {
+  const s = cur();
+  if (isOwn() || s.photoId === photoId) return;
+  invalidate(app.caseId);
+  s.photoId = photoId;
+  renderDynamic();
 }
 
-function handleUpload() {
-  const file = els.upload.files[0];
-  els.uploadError.textContent = '';
-  if (!file) return;
-  if (!TYPES.includes(file.type)) return rejectUpload('That file is not a JPG or PNG. Choose a .jpg or .png photo.');
-  if (file.size > MAX_BYTES) return rejectUpload(`That photo is ${(file.size / 1048576).toFixed(1)} MB. The limit is 5 MB.`);
-  const seq = ++uploadSeq;
-  readAsDataUrl(file).then((dataUrl) => {
-    if (seq !== uploadSeq) return;
-    els.form.elements.sample.forEach((r) => { r.checked = false; });
-    setImage({ sampleId: null, src: dataUrl, label: `Uploaded: ${file.name}`, mimeType: file.type, dataUrl });
-  }, () => seq === uploadSeq && rejectUpload('That photo could not be read. Try another file.'));
+function setMode(mode) {
+  if (mode === app.mode) return;
+  app.mode = mode;
+  invalidateAll();
+  renderAll();
+  announce(mode === 'live' ? `Live mode, ${PROVIDER_LABEL[settings.get().provider]}.` : 'Demo data mode.');
 }
 
-function rejectUpload(message) {
-  els.upload.value = '';
-  els.uploadError.textContent = message;
+function runBlocker() {
+  if (!isOwn()) return null;
+  const s = cur();
+  if (app.mode === 'demo') return 'Your own photos need Live mode and an API key.';
+  if (!s.image) return 'Add a photo first.';
+  if (!s.complaint.trim()) return 'Type the resident’s complaint first.';
+  return null;
 }
 
-function setImage(image) {
-  state.image = image;
-  els.previewImg.src = image.src;
-  els.previewImg.alt = image.sampleId ? `Repair photo: ${image.label}` : 'Uploaded repair photo';
-  els.previewCap.textContent = image.label;
-  els.preview.hidden = false;
-  invalidate();
+const sampleCache = new Map();
+async function sampleDataUrl(photoId, signal) {
+  if (sampleCache.has(photoId)) return sampleCache.get(photoId);
+  const res = await fetch(SAMPLES[photoId].file, { signal });
+  if (!res.ok) throw new ReviewError('Could not load the sample photo.');
+  const blob = await res.blob();
+  const dataUrl = await readAsDataUrl(blob);
+  const img = { dataUrl, mimeType: SAMPLES[photoId].mimeType || blob.type };
+  sampleCache.set(photoId, img);
+  return img;
 }
-
 function readAsDataUrl(blob) {
   return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(blob);
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result));
+    r.onerror = () => reject(new ReviewError('Could not read the photo.'));
+    r.readAsDataURL(blob);
   });
 }
 
-async function loadSampleDataUrl(image) {
-  if (image.dataUrl) return image.dataUrl;
-  const res = await fetch(image.src);
-  if (!res.ok) throw new ReviewError('The sample photo could not be loaded. Reload the page and try again.');
-  image.dataUrl = await readAsDataUrl(await res.blob());
-  return image.dataUrl;
-}
+async function run() {
+  const id = app.caseId;
+  const s = cur();
+  if (runBlocker()) return;
+  const { provider, apiKey } = settings.get();
+  if (app.mode === 'live' && !apiKey) {
+    settings.open({ focusKey: true });
+    return;
+  }
+  abortRun(id);
+  invalidate(id);
 
-// Any change to the complaint or photo makes the old result stale: drop it and any decision.
-function invalidate() {
-  state.controller?.abort();
-  Object.assign(state, { review: null, error: null, decision: null, running: false, controller: null });
-  state.runId++;
-  els.formError.textContent = '';
-  render();
-}
-
-// ---------- Review ----------
-
-async function runReview() {
-  const complaint = complaintText();
-  els.formError.textContent = '';
-  if (!complaint) return formError('Add the complaint text first.', els.complaint);
-  if (!state.image) return formError('Choose a sample photo or upload one first.', els.samples.querySelector('input'));
-  const live = mode() === 'live';
-  const apiKey = els.apiKey.value.trim();
-  if (live && !apiKey) return formError('Add an API key to run a live review.', els.apiKey);
-  const provider = els.provider.value;
-  const via = live ? els.provider.selectedOptions[0].text : 'Demo';
-
-  state.controller?.abort();
   const controller = new AbortController();
-  const runId = ++state.runId;
-  Object.assign(state, { controller, running: true, review: null, error: null, decision: null });
-  render();
-  if (document.activeElement === document.body || document.activeElement === els.reviewBtn) els.result.focus({ preventScroll: true });
+  const token = ++runSeq;
+  const key = freshKey(id);
+  const photoId = isOwn() ? null : s.photoId;
+  s.run = { controller, token, timer: null };
+  s.statusText = app.mode === 'demo' ? DEMO_STATUS[0] : `Sending the photo to ${PROVIDER_LABEL[provider]}…`;
+  if (app.mode === 'demo') {
+    let i = 0;
+    s.run.timer = setInterval(() => setStatus(id, token, DEMO_STATUS[Math.min(++i, DEMO_STATUS.length - 1)]), 240);
+  }
+  renderDynamic();
+  announce('Running second look.');
 
   try {
-    const image = state.image;
-    // Demo mode never sends the image, so it needs no fetch.
-    const dataUrl = !live ? null : image.sampleId ? await loadSampleDataUrl(image) : image.dataUrl;
+    const image = app.mode === 'live' ? (isOwn() ? s.image : await sampleDataUrl(photoId, controller.signal)) : null;
     const review = await reviewPhoto({
-      complaint,
-      image: { dataUrl, mimeType: image.mimeType },
-      sampleId: image.sampleId,
-      mode: live ? 'live' : 'demo',
-      provider: live ? provider : undefined,
-      apiKey: live ? apiKey : undefined,
-      signal: controller.signal,
+      complaint: complaintOf(id), image, photoId, mode: app.mode, provider, apiKey, signal: controller.signal,
+      onStatus: (text) => { setStatus(id, token, text); announce(text); },
     });
-    if (runId !== state.runId) return;
-    state.review = { ...review, complaint, photo: image.label, via };
+    if (s.run?.token !== token) return;
+    const at = new Date();
+    s.result = { review, key, at, photoId };
+    s.message = review.next_photo_request || '';
+    s.events.push({
+      kind: 'review', status: review.status, fresh: true, at,
+      title: `Second look: ${STATUS_LABELS[review.status]}`,
+      detail: `${capital(attemptLabel(id, photoId))}${photoId ? ` (${SAMPLES[photoId].label})` : ''} · ${review.model}`,
+    });
+    finishRun(id);
+    flashDone(VERDICT_TONE[review.status]);
+    announce(`${STATUS_LABELS[review.status]}. ${review.observation}`);
   } catch (err) {
-    if (runId !== state.runId || err?.name === 'AbortError') return;
-    state.retryable = !(err instanceof DemoUnavailableError);
-    state.error = err instanceof DemoUnavailableError ? DEMO_HINT
-      : err instanceof ReviewError ? err.message
-      : 'Something went wrong while checking the photo. Try again.';
+    if (s.run?.token !== token) return;
+    if (err?.name === 'AbortError') return;
+    s.error = {
+      message: err instanceof ReviewError ? err.message : 'Something went wrong reaching the AI. Check your connection and try again.',
+      canRetry: !(err instanceof DemoUnavailableError),
+    };
+    finishRun(id);
+    announce(`Review unavailable. ${s.error.message}`);
   }
-  state.running = false;
-  state.controller = null;
-  render();
 }
 
-function formError(message, focusTarget) {
-  els.formError.textContent = message;
-  focusTarget?.focus();
+function finishRun(id) {
+  const s = app.states[id];
+  clearInterval(s.run?.timer);
+  s.run = null;
+  s.statusText = '';
+  if (id === app.caseId) setScanning(false);
+  renderDynamic();
 }
+
+function setStatus(id, token, text) {
+  const s = app.states[id];
+  if (s.run?.token !== token) return;
+  s.statusText = text;
+  if (id === app.caseId) {
+    setScanning(true, text);
+    updateLoadingText($('review-body'), text);
+  }
+}
+
+const capital = (t) => t.charAt(0).toUpperCase() + t.slice(1);
+
+// ---------- decisions + undo ----------
+
+let pendingUndo = null;
 
 function decide(kind) {
-  if (!state.review || state.decision || state.running) return;
-  if (kind === 'accept' && state.review.status !== 'ready') return;
-  state.decision = kind;
-  render();
-  els.decision.focus();
+  const id = app.caseId;
+  const s = cur();
+  if (!isFresh(id) || s.decision) return;
+  if (kind === 'closed' && s.result.review.status !== 'ready') return;
+  const at = new Date();
+  const label = isOwn() ? 'This check' : id;
+  const ev = kind === 'closed'
+    ? { kind, at, fresh: true, title: 'Supervisor: signed off and closed', detail: `On the ${attemptLabel(id, s.result.photoId)} photo.` }
+    : { kind, at, fresh: true, title: 'Supervisor: sent back to crew', detail: s.message.trim() ? `“${s.message.trim()}”` : 'Returned without a message.' };
+  s.decision = { kind, at };
+  s.events.push(ev);
+  renderDynamic();
+  showToast(kind === 'closed' ? `${label} signed off and closed.` : `${label} sent back to the crew.`, () => {
+    if (s.decision?.at !== at) return;
+    s.decision = null;
+    s.events = s.events.filter((e) => e !== ev);
+    renderDynamic();
+    announce('Decision undone.');
+  }, id);
 }
 
-// ---------- Rendering ----------
-
-function render() {
-  renderResult();
-  const { review, decision, running } = state;
-  const fresh = Boolean(review) && !running && !decision;
-  els.accept.disabled = !(fresh && review.status === 'ready');
-  els.followup.disabled = !fresh;
-  els.decision.className = `decision${decision ? ` is-${decision}` : ''}`;
-  els.decision.textContent = decision === 'accept' ? 'Complaint closed by supervisor.'
-    : decision === 'followup' ? `Follow-up sent to the field team${review?.next_photo_request ? `: ${review.next_photo_request}` : '.'}`
-    : '';
-  els.reviewBtn.disabled = running;
-  els.reviewBtn.classList.toggle('is-busy', running);
-  els.reviewBtn.querySelector('.btn-label').textContent = running ? 'Reviewing…' : 'Review photo';
-  syncInputs();
+let toastTimer = 0;
+function showToast(text, undo, caseId) {
+  dismissToast();
+  const toast = $('toast');
+  $('toast-text').textContent = text;
+  toast.hidden = false;
+  toast.classList.remove('is-leaving');
+  pendingUndo = { undo, caseId };
+  announce(`${text} Undo available for 5 seconds.`);
+  toastTimer = setTimeout(dismissToast, UNDO_MS);
 }
-
-function renderResult() {
-  const box = els.result;
-  box.replaceChildren();
-  box.setAttribute('aria-busy', String(state.running));
-  if (state.running) {
-    const p = el('p', 'result-loading');
-    p.append(el('span', 'spinner'), el('span', null, 'Checking the photo against the complaint…'));
-    box.append(p);
-    return;
-  }
-  if (state.error) {
-    const badge = el('p', 'badge badge-error');
-    badge.innerHTML = ICONS.error;
-    badge.append(el('span', null, 'Review unavailable'));
-    const retry = el('button', 'btn btn-secondary btn-small', 'Retry');
-    retry.type = 'button';
-    retry.addEventListener('click', runReview);
-    box.append(badge, el('p', 'result-text', state.error));
-    if (state.retryable) box.append(retry);
-    return;
-  }
-  const r = state.review;
-  if (!r) {
-    box.append(el('p', 'result-empty', 'No review yet. Choose a complaint and a repair photo, then select Review photo.'));
-    return;
-  }
-  const ready = r.status === 'ready';
-  const badge = el('p', `badge ${ready ? 'badge-ready' : 'badge-needs'}`);
-  badge.innerHTML = ICONS[ready ? 'ready' : 'needs_photo'];
-  badge.append(el('span', null, ready ? 'Ready for human review' : 'Request another photo'));
-  box.append(badge, el('h3', 'result-label', 'What the photo shows'), el('p', 'result-text', r.observation));
-  if (r.next_photo_request) {
-    box.append(el('h3', 'result-label', 'Photo needed'), el('p', 'result-request', r.next_photo_request));
-  }
-  const meta = el('dl', 'result-meta');
-  for (const [k, v] of [['Complaint', `“${r.complaint}”`], ['Photo', r.photo], ['Checked by', r.via]]) {
-    meta.append(el('dt', null, k), el('dd', null, v));
-  }
-  box.append(meta);
+function dismissToast() {
+  clearTimeout(toastTimer);
+  pendingUndo = null;
+  const toast = $('toast');
+  if (toast.contains(document.activeElement)) $('decision-title').closest('.panel').querySelector('button')?.focus();
+  toast.hidden = true;
 }
+$('toast-undo').addEventListener('click', () => {
+  const p = pendingUndo;
+  dismissToast();
+  p?.undo();
+});
 
-function syncInputs() {
-  const text = complaintText();
-  const preset = presetFor(text);
-  for (const chip of els.chips.children) chip.setAttribute('aria-pressed', String(chip.dataset.id === preset?.id));
-  document.querySelectorAll('.step').forEach((btn) => {
-    const s = STEPS[btn.dataset.step];
-    const current = preset?.id === s.complaint && state.image?.sampleId === s.sample;
-    current ? btn.setAttribute('aria-current', 'step') : btn.removeAttribute('aria-current');
+// ---------- own photo ----------
+
+let uploadSeq = 0;
+function onOwnFile(file) {
+  const s = app.states[OWN];
+  const token = ++uploadSeq;
+  s.uploadError = '';
+  if (!['image/jpeg', 'image/png'].includes(file.type)) s.uploadError = 'That file isn’t a JPG or PNG.';
+  else if (file.size > MAX_BYTES) {
+    const mb = file.size / 1048576;
+    s.uploadError = mb < 5.05 ? 'That photo is just over the 5 MB limit.' : `That photo is ${mb.toFixed(1)} MB. The limit is 5 MB.`;
+  }
+  if (s.uploadError) { renderDynamic(); return; }
+  readAsDataUrl(file).then((dataUrl) => {
+    if (token !== uploadSeq) return;
+    invalidate(OWN);
+    const at = new Date();
+    s.image = { dataUrl, mimeType: file.type, name: file.name, stamp: at.getTime() };
+    s.events.push({ kind: 'crew', title: 'Photo added', detail: file.name, at, fresh: true });
+    renderDynamic();
+  }).catch(() => {
+    if (token !== uploadSeq) return;
+    s.uploadError = 'Could not read that file. Try another photo.';
+    renderDynamic();
   });
-  const custom = (text && !preset) || (state.image && !state.image.sampleId);
-  els.hint.hidden = !(mode() === 'demo' && custom);
 }
 
-function syncMode() {
-  const live = mode() === 'live';
-  els.liveFields.hidden = !live;
-  els.modeNote.textContent = live
-    ? 'Live sends the complaint and photo to the selected model. Use your own key.'
-    : 'Demo uses saved reviews for the sample photos and preset complaints. No key needed.';
-  syncInputs();
+// ---------- rendering ----------
+
+let announceTimer = 0;
+function announce(text) {
+  const el = $('announcer');
+  clearTimeout(announceTimer);
+  el.textContent = '';
+  announceTimer = setTimeout(() => { el.textContent = text; }, 60);
 }
 
-// ---------- Wiring ----------
-
-function runStep(index) {
-  const step = STEPS[index];
-  setComplaint(COMPLAINTS.find((c) => c.id === step.complaint).text);
-  selectSample(step.sample);
-  if (mode() !== 'demo') return els.reviewBtn.focus();
-  runReview();
-  // On stacked (narrow) layouts the result sits far below; bring it into view.
-  if (matchMedia('(max-width: 880px)').matches) els.result.closest('.result').scrollIntoView({ block: 'start' });
+function renderAll() {
+  renderInputs();
+  renderDynamic();
 }
 
-function init() {
-  buildInputs();
-  els.complaint.addEventListener('input', invalidate);
-  els.upload.addEventListener('change', handleUpload);
-  els.form.addEventListener('submit', (e) => { e.preventDefault(); runReview(); });
-  els.form.addEventListener('change', (e) => { if (e.target.name === 'mode') { syncMode(); invalidate(); } });
-  els.accept.addEventListener('click', () => decide('accept'));
-  els.followup.addEventListener('click', () => decide('followup'));
-  document.querySelectorAll('.step').forEach((btn) => btn.addEventListener('click', () => runStep(Number(btn.dataset.step))));
-
-  els.apiKey.value = session.get(STORE_KEY) || '';
-  els.apiKey.addEventListener('input', () => session.set(STORE_KEY, els.apiKey.value.trim()));
-  const provider = session.get(STORE_PROVIDER);
-  if (provider === 'claude' || provider === 'gemini') els.provider.value = provider;
-  els.provider.addEventListener('change', () => session.set(STORE_PROVIDER, els.provider.value));
-
-  syncMode();
-  render();
+// Lists are re-rendered from state; keep keyboard focus on the equivalent control afterwards.
+function focusKey(el) {
+  if (!(el instanceof HTMLElement)) return null;
+  if (el.dataset.case) return `[data-case="${CSS.escape(el.dataset.case)}"]`;
+  if (el.dataset.key) return `.thumb[data-key="${CSS.escape(el.dataset.key)}"]`;
+  return null;
 }
 
-init();
+function renderDynamic() {
+  const active = document.activeElement;
+  const restore = focusKey(active);
+  renderDynamicInner();
+  if (restore && !document.contains(active)) document.querySelector(restore)?.focus();
+}
+
+function renderDynamicInner() {
+  renderModeControl();
+  renderQueueAndHead();
+  renderEvidence();
+  renderReview();
+  renderDecision();
+  renderTimeline($('timeline'), cur().events.length ? cur().events : []);
+  if (!cur().events.length) mount($('timeline'), h('li.tl-empty', { text: 'Nothing yet. Add a photo to start the trail.' }));
+  for (const st of Object.values(app.states)) st.events.forEach((e) => { e.fresh = false; });
+}
+
+function renderModeControl() {
+  for (const b of document.querySelectorAll('.mode-opt')) {
+    const on = b.dataset.mode === app.mode;
+    b.setAttribute('aria-checked', String(on));
+    b.tabIndex = on ? 0 : -1;
+  }
+  document.body.dataset.mode = app.mode;
+  $('own-sub').textContent = app.mode === 'live' ? 'Upload a JPG or PNG, type the complaint' : 'Needs Live mode and an API key';
+}
+
+function renderQueueAndHead() {
+  renderQueue($('queue-list'), { cases: CASES, states: app.states, selectedId: app.caseId, onSelect: selectCase });
+  $('queue-count').textContent = `${CASES.length} cases`;
+  const ownBtn = $('own-btn');
+  ownBtn.setAttribute('aria-pressed', String(isOwn()));
+  ownBtn.classList.toggle('is-selected', isOwn());
+
+  const head = $('case-head');
+  const s = cur();
+  if (isOwn()) {
+    mount(head,
+      h('div.case-title', {},
+        h('span.case-id', { text: 'NEW' }),
+        h('h1', { text: 'Review your own photo' }),
+        h('p.case-meta', {}, h('span', {}, icon('info'), 'One-off check, not linked to a ward case'))),
+      h('div.case-status', {}, chip(chipKey(s), 'chip-lg')));
+    return;
+  }
+  const c = caseById[app.caseId];
+  mount(head,
+    h('div.case-title', {},
+      h('span.case-id', { text: c.id, translate: 'no' }),
+      h('h1', { text: c.title }),
+      h('p.case-meta', {},
+        h('span', {}, icon('pin'), c.location),
+        h('span', {}, icon('person'), c.reportedBy),
+        h('span', {}, icon('clock'), h('time', { datetime: isoAttr(c.reportedAt), text: `${formatStamp(c.reportedAt)} · ${ago(c.reportedAt)}` })))),
+    h('div.case-status', {}, chip(chipKey(s), 'chip-lg')));
+}
+
+function renderEvidence() {
+  const s = cur();
+  const meta = $('photo-meta');
+  if (isOwn()) {
+    if (s.image) {
+      showPhoto(s.image.dataUrl, `Your uploaded photo: ${s.image.name}`);
+      meta.textContent = s.uploadError ? `${s.uploadError} Keeping ${s.image.name}.` : s.image.name;
+      const replace = h('label.btn.btn-ghost.btn-sm.replace', { for: 'own-replace' }, icon('upload'), 'Replace photo');
+      const input = h('input.sr-only', { type: 'file', id: 'own-replace', accept: 'image/jpeg,image/png,.jpg,.jpeg,.png' });
+      input.addEventListener('change', () => input.files?.[0] && onOwnFile(input.files[0]));
+      renderFilmstrip([{ key: 'own', src: s.image.dataUrl, label: s.image.name, attempt: 'Your photo' }], 'own', () => {}, { extra: [replace, input] });
+    } else {
+      meta.textContent = '';
+      showEmpty(dropzone({ live: app.mode === 'live', onFile: onOwnFile, onSwitchLive: () => setMode('live'), error: s.uploadError }));
+      clear($('filmstrip'));
+    }
+  } else {
+    const c = caseById[app.caseId];
+    const sample = SAMPLES[s.photoId];
+    const n = c.photos.indexOf(s.photoId) + 1;
+    showPhoto(sample.file, `Attempt ${n} repair photo: ${sample.label}`);
+    meta.textContent = `Attempt ${n} of ${c.photos.length}`;
+    renderFilmstrip(
+      c.photos.map((pid, i) => ({ key: pid, src: SAMPLES[pid].file, label: SAMPLES[pid].label, attempt: `Attempt ${i + 1}` })),
+      s.photoId, selectPhoto);
+  }
+  setScanning(Boolean(s.run), s.statusText);
+}
+
+let reviewSig = '';
+function renderReview() {
+  const id = app.caseId;
+  const s = cur();
+  const body = $('review-body');
+  const blocker = runBlocker();
+  const fresh = isFresh(id);
+  const { apiKey } = settings.get();
+
+  // Header controls
+  const runBtn = $('run-btn');
+  runBtn.disabled = Boolean(s.run) || Boolean(blocker);
+  runBtn.classList.toggle('btn-amber', !fresh);
+  runBtn.classList.toggle('btn-secondary', fresh);
+  $('run-label').textContent = s.run ? 'Reviewing…' : app.mode === 'live' && !apiKey && !blocker ? 'Add API key to run' : fresh ? 'Run again' : 'Run second look';
+  $('cancel-btn').hidden = !s.run;
+  const note = $('run-note');
+  note.hidden = !blocker;
+  note.textContent = blocker || '';
+
+  const sig = [id, s.run ? `run${s.run.token}` : '', fresh ? s.result.at.getTime() : '', s.error?.message || '', blocker || '', app.mode].join('|');
+  if (sig === reviewSig) return;
+  reviewSig = sig;
+
+  if (s.run) {
+    renderLoading(body, { text: s.statusText });
+  } else if (s.error) {
+    const extra = app.mode === 'demo' && !s.error.canRetry && isOwn()
+      ? h('button.btn.btn-ghost.btn-sm', { type: 'button', onclick: () => setMode('live') }, 'Switch to Live') : null;
+    renderError(body, { message: s.error.message, canRetry: s.error.canRetry, onRetry: run, extra });
+  } else if (fresh) {
+    renderResult(body, {
+      review: s.result.review,
+      statusLabel: STATUS_LABELS[s.result.review.status],
+      ranAt: s.result.at,
+      photoLabel: attemptLabel(id, s.result.photoId),
+      message: s.message,
+      onMessage: (v) => { s.message = v; },
+    });
+  } else {
+    const lines = isOwn()
+      ? [blocker || 'Ready when you are.', 'SecondLook splits the complaint into checkable claims and tests each one against what the photo visibly shows.']
+      : [`No second look yet on ${attemptLabel(id)}.`, 'SecondLook splits the complaint into checkable claims and tests each one against what the photo visibly shows.'];
+    renderIdle(body, { lines });
+  }
+}
+
+function renderDecision() {
+  const id = app.caseId;
+  const s = cur();
+  const fresh = isFresh(id);
+  const ready = fresh && s.result.review.status === 'ready';
+  $('signoff-btn').disabled = !(ready && !s.decision && !s.run);
+  $('sendback-btn').disabled = !(fresh && !s.decision && !s.run);
+  const why = $('decision-why');
+  const who = isOwn() ? 'this check' : id;
+  let text;
+  if (s.run) text = 'Waiting for the second look…';
+  else if (s.decision?.kind === 'closed') text = `Signed off and closed at ${formatTime(s.decision.at)}. A new photo or a new review reopens it.`;
+  else if (s.decision?.kind === 'sent_back') text = `Sent back to the crew at ${formatTime(s.decision.at)}.`;
+  else if (!fresh) text = 'Run a second look on this photo before deciding.';
+  else if (ready) text = `The photo answers the complaint. Signing off closes ${who}.`;
+  else text = 'Sign-off needs a “Ready for sign-off” result. Send it back with the message above.';
+  why.textContent = text;
+  $('decision-panel').classList.toggle('is-decided', Boolean(s.decision));
+  $('decision-panel').dataset.decision = s.decision?.kind || '';
+}
+
+function renderInputs() {
+  const box = $('inputs');
+  if (isOwn()) {
+    const s = app.states[OWN];
+    const ta = h('textarea', {
+      id: 'own-complaint', rows: 3, placeholder: 'e.g. The streetlight beside Gate 2 stays dark at night…',
+      'aria-describedby': 'own-complaint-hint',
+    });
+    ta.value = s.complaint;
+    ta.addEventListener('input', () => {
+      s.complaint = ta.value;
+      invalidate(OWN);
+      renderDynamic();
+    });
+    const preset = (text) => h('button.preset', {
+      type: 'button', onclick: () => { ta.value = text; ta.dispatchEvent(new Event('input')); ta.focus(); },
+    }, text);
+    mount(box,
+      h('div.panel.complaint', {},
+        h('div.panel-head', {}, h('h2', {}, h('label', { for: 'own-complaint', text: 'Resident’s complaint' }))),
+        ta,
+        h('p.hint', { id: 'own-complaint-hint', text: 'Use the resident’s own words. The photo is checked against exactly this text.' }),
+        h('div.presets', { role: 'group', 'aria-label': 'Sample complaints' }, Object.values(COMPLAINTS).map(preset))));
+    return;
+  }
+  const c = caseById[app.caseId];
+  mount(box,
+    h('section.panel.complaint', { 'aria-labelledby': 'complaint-title' },
+      h('div.panel-head', {}, h('h2', { id: 'complaint-title', text: 'Resident’s complaint' })),
+      h('figure.quote', {},
+        icon('quote', 'quote-mark'),
+        h('blockquote', {}, h('p', { text: COMPLAINTS[c.complaintId] })),
+        h('figcaption', {}, `${c.reportedBy} · `, h('time', { datetime: isoAttr(c.reportedAt), text: formatStamp(c.reportedAt) })))),
+    h('section.panel.crew', { 'aria-labelledby': 'crew-title' },
+      h('div.panel-head', {}, h('h2', { id: 'crew-title' }, 'Crew marked fixed')),
+      h('p.crew-note', {}, icon('wrench'), h('span', { text: c.crewNote })),
+      h('p.crew-sub', { text: `${c.photos.length} photos attached. Each attempt is checked on its own.` })));
+}
+
+// ---------- wiring ----------
+
+$('run-btn').addEventListener('click', run);
+$('cancel-btn').addEventListener('click', () => {
+  abortRun(app.caseId);
+  renderDynamic();
+  announce('Review cancelled.');
+  $('run-btn').focus();
+});
+$('signoff-btn').addEventListener('click', () => decide('closed'));
+$('sendback-btn').addEventListener('click', () => decide('sent_back'));
+$('own-btn').addEventListener('click', () => selectCase(OWN));
+
+const modeOpts = [...document.querySelectorAll('.mode-opt')];
+modeOpts.forEach((b, i) => {
+  b.addEventListener('click', () => setMode(b.dataset.mode));
+  b.addEventListener('keydown', (e) => {
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const next = modeOpts[(i + 1) % modeOpts.length];
+    setMode(next.dataset.mode);
+    next.focus();
+  });
+});
+
+const presenter = createPresenter({
+  steps: DEMO_STEPS,
+  onStep: (step) => {
+    settings.close({ restoreFocus: false });
+    setMode('demo');
+    if (app.caseId !== step.caseId) selectCase(step.caseId);
+    const s = cur();
+    if (s.photoId !== step.photoId) { invalidate(app.caseId); s.photoId = step.photoId; }
+    renderDynamic();
+    run();
+    const stage = $('stage');
+    const r = stage.getBoundingClientRect();
+    if (r.top < 56 || r.bottom > innerHeight - 140) stage.scrollIntoView({ block: 'center', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+  },
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
+  const t = e.target;
+  if (t instanceof HTMLElement && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+  if (settings.isOpen()) return;
+  if (e.key === 'r' || e.key === 'R') {
+    e.preventDefault();
+    if (!$('run-btn').disabled) run();
+  } else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+    const dir = e.key === 'ArrowRight' ? 1 : -1;
+    if (presenter.isOpen()) {
+      e.preventDefault();
+      if (dir > 0) presenter.next(); else presenter.prev();
+    } else if (!isOwn()) {
+      e.preventDefault();
+      const photos = caseById[app.caseId].photos;
+      const i = photos.indexOf(cur().photoId);
+      selectPhoto(photos[(i + dir + photos.length) % photos.length]);
+    }
+  }
+});
+
+// First-load context strip: the problem in one line.
+const CONTEXT_KEY = 'secondlook.contextDismissed';
+let contextDismissed = false;
+try { contextDismissed = localStorage.getItem(CONTEXT_KEY) === '1'; } catch { /* storage blocked */ }
+$('context-strip').hidden = contextDismissed;
+$('context-close').addEventListener('click', () => {
+  $('context-strip').hidden = true;
+  try { localStorage.setItem(CONTEXT_KEY, '1'); } catch { /* storage blocked */ }
+  $('case-file').focus();
+});
+
+renderAll();
